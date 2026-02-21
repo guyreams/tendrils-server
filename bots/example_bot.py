@@ -1,7 +1,7 @@
 """Reference bot that plays Tendrils Server via the REST API.
 
-Creates a game, joins a Fighter and a Rogue, starts combat, and plays
-each turn by picking simple tactical actions:
+Joins a Fighter and a Rogue to the single persistent game, starts combat,
+and plays each turn by picking simple tactical actions:
   - If an enemy is adjacent, attack.
   - If an enemy is visible but not adjacent, move toward them.
   - Otherwise, end turn.
@@ -16,21 +16,14 @@ import time
 
 import httpx
 
-BASE_URL = "http://localhost:8000"
+BASE_URL = "http://127.0.0.1:8000"
 
 
 def main() -> None:
     """Run a complete game between a Fighter and a Rogue."""
     client = httpx.Client(base_url=BASE_URL, timeout=10.0)
 
-    # 1. Create a game
-    print("Creating game...")
-    resp = client.post("/games", json={"name": "Bot Arena"})
-    resp.raise_for_status()
-    game_id = resp.json()["game_id"]
-    print(f"  Game ID: {game_id}")
-
-    # 2. Join two characters
+    # 1. Join two characters
     fighter_data = {
         "owner_id": "bot_a",
         "name": "Gruk the Fighter",
@@ -84,33 +77,29 @@ def main() -> None:
     }
 
     print("Joining Fighter...")
-    resp = client.post(f"/games/{game_id}/join", json=fighter_data)
+    resp = client.post("/game/join", json=fighter_data)
     resp.raise_for_status()
-    fighter_id = resp.json()["character_id"]
-    print(f"  Fighter ID: {fighter_id}")
+    join_resp = resp.json()
+    fighter_id = join_resp["character_id"]
+    print(f"  Fighter ID: {fighter_id} — {join_resp['message']}")
 
     print("Joining Rogue...")
-    resp = client.post(f"/games/{game_id}/join", json=rogue_data)
+    resp = client.post("/game/join", json=rogue_data)
     resp.raise_for_status()
-    rogue_id = resp.json()["character_id"]
-    print(f"  Rogue ID: {rogue_id}")
+    join_resp = resp.json()
+    rogue_id = join_resp["character_id"]
+    print(f"  Rogue ID: {rogue_id} — {join_resp['message']}")
 
-    # Map owner_id to character_id for both bots
-    bots = {
-        fighter_id: "bot_a",
-        rogue_id: "bot_b",
-    }
-
-    # 3. Start combat
+    # 2. Start combat
     print("\nStarting combat...")
-    resp = client.post(f"/games/{game_id}/start")
+    resp = client.post("/game/start")
     resp.raise_for_status()
     start_data = resp.json()
     print(f"  {start_data['message']}")
     for entry in start_data["initiative_order"]:
         print(f"    {entry}")
 
-    # 4. Game loop
+    # 3. Game loop
     print("\n--- COMBAT ---\n")
     max_rounds = 100
     turn_count = 0
@@ -119,7 +108,7 @@ def main() -> None:
         turn_count += 1
 
         # Check game status
-        resp = client.get(f"/games/{game_id}")
+        resp = client.get("/game")
         resp.raise_for_status()
         game_info = resp.json()
 
@@ -130,7 +119,7 @@ def main() -> None:
         # Try each bot's perspective to find whose turn it is
         for char_id in [fighter_id, rogue_id]:
             resp = client.get(
-                f"/games/{game_id}/state",
+                "/game/state",
                 params={"character_id": char_id},
             )
             resp.raise_for_status()
@@ -152,7 +141,7 @@ def main() -> None:
 
             if not enemies:
                 # No enemies — end turn
-                _submit_action(client, game_id, char_id, "end_turn")
+                _submit_action(client, char_id, "end_turn")
                 break
 
             enemy = enemies[0]
@@ -163,7 +152,7 @@ def main() -> None:
             if dist <= 5:
                 # Adjacent — attack!
                 _submit_action(
-                    client, game_id, char_id, "attack",
+                    client, char_id, "attack",
                     target_id=enemy["id"],
                 )
             else:
@@ -172,20 +161,20 @@ def main() -> None:
                 dy = _sign(enemy_pos[1] - my_pos[1])
                 target = (my_pos[0] + dx, my_pos[1] + dy)
                 success = _submit_action(
-                    client, game_id, char_id, "move",
+                    client, char_id, "move",
                     target_position=list(target),
                 )
                 if not success:
                     # Movement failed, just end turn
-                    _submit_action(client, game_id, char_id, "end_turn")
+                    _submit_action(client, char_id, "end_turn")
 
             break
 
         time.sleep(0.1)  # Small delay for readability
 
-    # 5. Print the full event log
+    # 4. Print the full event log
     print("\n--- EVENT LOG ---\n")
-    resp = client.get(f"/games/{game_id}/log")
+    resp = client.get("/game/log")
     resp.raise_for_status()
     for event in resp.json():
         print(f"  [Round {event['round']}] {event['description']}")
@@ -195,7 +184,6 @@ def main() -> None:
 
 def _submit_action(
     client: httpx.Client,
-    game_id: str,
     character_id: str,
     action_type: str,
     target_id: str | None = None,
@@ -211,7 +199,7 @@ def _submit_action(
     if target_position:
         payload["target_position"] = target_position
 
-    resp = client.post(f"/games/{game_id}/action", json=payload)
+    resp = client.post("/game/action", json=payload)
     if resp.status_code == 200:
         result = resp.json()
         print(f"  -> {result['description']}")

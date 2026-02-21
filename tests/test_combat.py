@@ -1,5 +1,8 @@
 """Tests for combat orchestration: initiative, turns, win conditions."""
 
+import os
+import tempfile
+
 import pytest
 
 from engine.combat import (
@@ -8,8 +11,12 @@ from engine.combat import (
     check_win_condition,
     create_game,
     get_current_turn_character,
+    load_game,
     process_action,
+    remove_dead_characters,
+    save_game,
     start_combat,
+    transition_to_waiting,
 )
 from models.actions import ActionRequest, ActionType
 from models.characters import AbilityScores, Attack, Character
@@ -288,3 +295,145 @@ class TestProcessAction:
         _, result = process_action(gs, current.id, action)
         assert result.success
         assert current.position == target
+
+
+class TestSaveAndLoadGame:
+    """Tests for save_game() and load_game()."""
+
+    def test_save_and_load_roundtrip(self, tmp_path):
+        path = str(tmp_path / "test_save.json")
+        gs = create_game("game1", name="Test Arena")
+        c1 = _make_character("c1", "owner1")
+        c2 = _make_character("c2", "owner2")
+        add_character(gs, c1, (1, 1))
+        add_character(gs, c2, (3, 3))
+
+        save_game(gs, path)
+        loaded = load_game(path)
+
+        assert loaded is not None
+        assert loaded.game_id == "game1"
+        assert loaded.name == "Test Arena"
+        assert "c1" in loaded.characters
+        assert "c2" in loaded.characters
+        assert loaded.characters["c1"].position == (1, 1)
+        assert loaded.characters["c2"].position == (3, 3)
+
+    def test_load_nonexistent_returns_none(self, tmp_path):
+        path = str(tmp_path / "does_not_exist.json")
+        assert load_game(path) is None
+
+    def test_save_preserves_active_state(self, tmp_path):
+        path = str(tmp_path / "active_save.json")
+        gs = create_game("game1")
+        c1 = _make_character("c1", "owner1")
+        c2 = _make_character("c2", "owner2")
+        add_character(gs, c1, (1, 1))
+        add_character(gs, c2, (3, 3))
+        start_combat(gs)
+
+        save_game(gs, path)
+        loaded = load_game(path)
+
+        assert loaded.status == GameStatus.ACTIVE
+        assert len(loaded.initiative_order) == 2
+        assert loaded.round_number == 1
+
+
+class TestRemoveDeadCharacters:
+    """Tests for remove_dead_characters()."""
+
+    def test_removes_dead_keeps_alive(self):
+        gs = create_game("game1")
+        c1 = _make_character("c1", "owner1")
+        c2 = _make_character("c2", "owner2")
+        add_character(gs, c1, (1, 1))
+        add_character(gs, c2, (3, 3))
+        gs.characters["c2"].is_alive = False
+        gs.characters["c2"].current_hp = 0
+
+        remove_dead_characters(gs)
+
+        assert "c1" in gs.characters
+        assert "c2" not in gs.characters
+        assert gs.grid[3][3].occupant_id is None
+
+    def test_clears_grid_occupant(self):
+        gs = create_game("game1")
+        c1 = _make_character("c1", "owner1")
+        add_character(gs, c1, (5, 5))
+        gs.characters["c1"].is_alive = False
+
+        remove_dead_characters(gs)
+        assert gs.grid[5][5].occupant_id is None
+
+    def test_no_dead_is_noop(self):
+        gs = create_game("game1")
+        c1 = _make_character("c1", "owner1")
+        add_character(gs, c1, (1, 1))
+
+        remove_dead_characters(gs)
+        assert "c1" in gs.characters
+
+
+class TestTransitionToWaiting:
+    """Tests for transition_to_waiting()."""
+
+    def test_resets_to_waiting(self):
+        gs = create_game("game1")
+        c1 = _make_character("c1", "owner1")
+        c2 = _make_character("c2", "owner2")
+        add_character(gs, c1, (1, 1))
+        add_character(gs, c2, (3, 3))
+        start_combat(gs)
+
+        # Simulate game completion
+        gs.characters["c2"].is_alive = False
+        gs.characters["c2"].current_hp = 0
+        gs.status = GameStatus.COMPLETED
+        gs.winner_id = "owner1"
+
+        transition_to_waiting(gs)
+
+        assert gs.status == GameStatus.WAITING
+        assert gs.winner_id is None
+        assert gs.initiative_order == []
+        assert gs.round_number == 1
+        assert gs.event_log == []
+
+    def test_removes_dead_keeps_survivors(self):
+        gs = create_game("game1")
+        c1 = _make_character("c1", "owner1")
+        c2 = _make_character("c2", "owner2")
+        add_character(gs, c1, (1, 1))
+        add_character(gs, c2, (3, 3))
+        start_combat(gs)
+
+        gs.characters["c2"].is_alive = False
+        gs.characters["c2"].current_hp = 0
+        gs.status = GameStatus.COMPLETED
+
+        transition_to_waiting(gs)
+
+        assert "c1" in gs.characters
+        assert "c2" not in gs.characters
+        assert gs.characters["c1"].is_alive
+
+    def test_survivors_keep_current_hp(self):
+        gs = create_game("game1")
+        c1 = _make_character("c1", "owner1", hp=50)
+        c2 = _make_character("c2", "owner2")
+        add_character(gs, c1, (1, 1))
+        add_character(gs, c2, (3, 3))
+        start_combat(gs)
+
+        # Survivor took some damage
+        gs.characters["c1"].current_hp = 30
+        gs.characters["c2"].is_alive = False
+        gs.characters["c2"].current_hp = 0
+        gs.status = GameStatus.COMPLETED
+
+        transition_to_waiting(gs)
+
+        assert gs.characters["c1"].current_hp == 30
+        assert gs.characters["c1"].max_hp == 50

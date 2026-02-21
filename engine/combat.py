@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import os
 from datetime import datetime, timezone
+from pathlib import Path
 
 from config import GRID_HEIGHT, GRID_WIDTH, TURN_TIMEOUT_SECONDS
 from engine.dice import roll
@@ -332,6 +335,75 @@ def check_win_condition(game_state: GameState) -> str | None:
     if len(alive_owners) == 0:
         return None  # Everyone is dead — draw
     return None
+
+
+def remove_dead_characters(game_state: GameState) -> None:
+    """Remove all dead characters from the game and clear their grid cells.
+
+    Args:
+        game_state: Current game state (mutated in place).
+    """
+    dead_ids = [
+        cid for cid, char in game_state.characters.items()
+        if not char.is_alive
+    ]
+    for cid in dead_ids:
+        char = game_state.characters[cid]
+        if char.position is not None:
+            x, y = char.position
+            if game_state.grid[y][x].occupant_id == cid:
+                game_state.grid[y][x].occupant_id = None
+        del game_state.characters[cid]
+
+
+def transition_to_waiting(game_state: GameState) -> None:
+    """Reset a COMPLETED game back to WAITING for the next round.
+
+    Dead characters are removed. Survivors keep their current state.
+
+    Args:
+        game_state: Current game state (mutated in place).
+    """
+    remove_dead_characters(game_state)
+    game_state.initiative_order = []
+    game_state.current_turn_index = 0
+    game_state.round_number = 1
+    game_state.turn_deadline = None
+    game_state.winner_id = None
+    game_state.event_log = []
+    game_state.status = GameStatus.WAITING
+
+
+def save_game(game_state: GameState, path: str) -> None:
+    """Persist game state to a JSON file.
+
+    Writes to a temporary file first, then renames for atomicity.
+
+    Args:
+        game_state: The game state to save.
+        path: File path to write to.
+    """
+    tmp_path = path + ".tmp"
+    data = game_state.model_dump(mode="json")
+    with open(tmp_path, "w") as f:
+        json.dump(data, f, default=str)
+    os.replace(tmp_path, path)
+
+
+def load_game(path: str) -> GameState | None:
+    """Load game state from a JSON file.
+
+    Args:
+        path: File path to read from.
+
+    Returns:
+        The loaded GameState, or None if the file doesn't exist.
+    """
+    if not Path(path).exists():
+        return None
+    with open(path) as f:
+        data = json.load(f)
+    return GameState.model_validate(data)
 
 
 def _new_deadline() -> datetime:

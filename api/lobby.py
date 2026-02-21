@@ -1,31 +1,25 @@
-"""Game creation and bot registration endpoints."""
+"""Character registration, reconnection, and combat start endpoints."""
 
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from config import MAX_PLAYERS_PER_GAME
-from engine.combat import add_character, create_game, start_combat
+from config import MAX_PLAYERS_PER_GAME, SAVE_FILE
+from engine.combat import (
+    add_character,
+    save_game,
+    start_combat,
+    transition_to_waiting,
+)
 from models.characters import AbilityScores, Attack, Character
-from models.game_state import GameStatus
+from models.game_state import GameState, GameStatus
 
 router = APIRouter()
 
 
-class CreateGameRequest(BaseModel):
-    """Request body for creating a new game."""
-    name: str = "Arena"
-
-
-class CreateGameResponse(BaseModel):
-    """Response after creating a game."""
-    game_id: str
-    status: str
-
-
 class JoinGameRequest(BaseModel):
-    """Request body for joining a game with a character."""
+    """Request body for joining the game with a character."""
     owner_id: str
     name: str
     ability_scores: AbilityScores = AbilityScores()
@@ -36,7 +30,7 @@ class JoinGameRequest(BaseModel):
 
 
 class JoinGameResponse(BaseModel):
-    """Response after joining a game."""
+    """Response after joining or reconnecting to the game."""
     character_id: str
     message: str
 
@@ -47,54 +41,37 @@ class StartGameResponse(BaseModel):
     initiative_order: list[str]
 
 
-def _get_games(request: Request) -> dict:
-    """Get the games store from app state."""
-    return request.app.state.games
+def _get_game(request: Request) -> GameState:
+    """Get the singleton game from app state."""
+    return request.app.state.game
 
 
-@router.post("", response_model=CreateGameResponse)
-def create_new_game(body: CreateGameRequest, request: Request) -> CreateGameResponse:
-    """Create a new game and return the game_id."""
-    games = _get_games(request)
-    game_id = str(uuid4())
-    game_state = create_game(game_id, name=body.name)
-    games[game_id] = game_state
-    return CreateGameResponse(game_id=game_id, status=game_state.status.value)
+def _find_character_by_owner(game_state: GameState, owner_id: str) -> Character | None:
+    """Find a character owned by the given owner_id."""
+    for char in game_state.characters.values():
+        if char.owner_id == owner_id:
+            return char
+    return None
 
 
-@router.post("/{game_id}/join", response_model=JoinGameResponse)
-def join_game(game_id: str, body: JoinGameRequest, request: Request) -> JoinGameResponse:
-    """Register a bot and its character to a game."""
-    games = _get_games(request)
-    if game_id not in games:
-        raise HTTPException(status_code=404, detail="Game not found")
+def _remove_character(game_state: GameState, character_id: str) -> None:
+    """Remove a character from the game and clear their grid cell."""
+    char = game_state.characters.get(character_id)
+    if char is None:
+        return
+    if char.position is not None:
+        x, y = char.position
+        if game_state.grid[y][x].occupant_id == character_id:
+            game_state.grid[y][x].occupant_id = None
+    del game_state.characters[character_id]
 
-    game_state = games[game_id]
-    if game_state.status != GameStatus.WAITING:
-        raise HTTPException(status_code=400, detail="Game has already started")
 
-    if len(game_state.characters) >= MAX_PLAYERS_PER_GAME:
-        raise HTTPException(status_code=400, detail="Game is full")
-
-    character_id = str(uuid4())
-    character = Character(
-        id=character_id,
-        name=body.name,
-        owner_id=body.owner_id,
-        ability_scores=body.ability_scores,
-        max_hp=body.max_hp,
-        current_hp=body.max_hp,
-        armor_class=body.armor_class,
-        speed=body.speed,
-        attacks=body.attacks,
-    )
-
-    # Auto-assign a starting position (spread characters along the edges)
+def _place_character(game_state: GameState, character: Character) -> None:
+    """Find a starting position and place a character on the grid."""
     char_count = len(game_state.characters)
     grid_w = len(game_state.grid[0]) if game_state.grid else 20
     grid_h = len(game_state.grid) if game_state.grid else 20
 
-    # Place characters at different corners/edges
     positions = [
         (1, 1),
         (grid_w - 2, grid_h - 2),
@@ -111,7 +88,10 @@ def join_game(game_id: str, body: JoinGameRequest, request: Request) -> JoinGame
         for dx in range(grid_w):
             for dy in range(grid_h):
                 nx, ny = (px + dx) % grid_w, (py + dy) % grid_h
-                if game_state.grid[ny][nx].occupant_id is None and game_state.grid[ny][nx].terrain != "wall":
+                if (
+                    game_state.grid[ny][nx].occupant_id is None
+                    and game_state.grid[ny][nx].terrain != "wall"
+                ):
                     pos = (nx, ny)
                     break
             else:
@@ -119,24 +99,105 @@ def join_game(game_id: str, body: JoinGameRequest, request: Request) -> JoinGame
             break
 
     add_character(game_state, character, pos)
-    return JoinGameResponse(character_id=character_id, message="Joined game")
 
 
-@router.post("/{game_id}/start", response_model=StartGameResponse)
-def start_game(game_id: str, request: Request) -> StartGameResponse:
-    """Start combat in a game (requires 2+ characters)."""
-    games = _get_games(request)
-    if game_id not in games:
-        raise HTTPException(status_code=404, detail="Game not found")
+@router.post("/join", response_model=JoinGameResponse)
+def join_game(body: JoinGameRequest, request: Request) -> JoinGameResponse:
+    """Join the game or reconnect to an existing character.
 
-    game_state = games[game_id]
+    - If owner_id has a living character: reconnect and return existing character_id.
+    - If owner_id has a dead character: remove the dead one, create a new character.
+    - If owner_id is new: create a new character.
+    """
+    game_state = _get_game(request)
+
+    # Auto-transition from COMPLETED to WAITING
+    if game_state.status == GameStatus.COMPLETED:
+        transition_to_waiting(game_state)
+
+    if game_state.status != GameStatus.WAITING:
+        raise HTTPException(
+            status_code=400,
+            detail="Combat is in progress. Cannot join until it ends.",
+        )
+
+    existing = _find_character_by_owner(game_state, body.owner_id)
+
+    if existing is not None and existing.is_alive:
+        # Reconnect to existing living character
+        save_game(game_state, SAVE_FILE)
+        return JoinGameResponse(
+            character_id=existing.id,
+            message=f"Reconnected to {existing.name}",
+        )
+
+    if existing is not None and not existing.is_alive:
+        # Dead character — remove it and create a new one
+        old_name = existing.name
+        _remove_character(game_state, existing.id)
+
+        character_id = str(uuid4())
+        character = Character(
+            id=character_id,
+            name=body.name,
+            owner_id=body.owner_id,
+            ability_scores=body.ability_scores,
+            max_hp=body.max_hp,
+            current_hp=body.max_hp,
+            armor_class=body.armor_class,
+            speed=body.speed,
+            attacks=body.attacks,
+        )
+        _place_character(game_state, character)
+        save_game(game_state, SAVE_FILE)
+        return JoinGameResponse(
+            character_id=character_id,
+            message=(
+                f"Your previous character {old_name} has fallen. "
+                f"{body.name} has entered the arena."
+            ),
+        )
+
+    # New player
+    if len(game_state.characters) >= MAX_PLAYERS_PER_GAME:
+        raise HTTPException(status_code=400, detail="Game is full")
+
+    character_id = str(uuid4())
+    character = Character(
+        id=character_id,
+        name=body.name,
+        owner_id=body.owner_id,
+        ability_scores=body.ability_scores,
+        max_hp=body.max_hp,
+        current_hp=body.max_hp,
+        armor_class=body.armor_class,
+        speed=body.speed,
+        attacks=body.attacks,
+    )
+    _place_character(game_state, character)
+    save_game(game_state, SAVE_FILE)
+    return JoinGameResponse(
+        character_id=character_id,
+        message=f"{body.name} has entered the arena.",
+    )
+
+
+@router.post("/start", response_model=StartGameResponse)
+def start_game(request: Request) -> StartGameResponse:
+    """Start combat (requires 2+ characters)."""
+    game_state = _get_game(request)
+
     if game_state.status != GameStatus.WAITING:
         raise HTTPException(status_code=400, detail="Game has already started")
 
     if len(game_state.characters) < 2:
-        raise HTTPException(status_code=400, detail="Need at least 2 characters to start")
+        raise HTTPException(
+            status_code=400,
+            detail="Need at least 2 characters to start",
+        )
 
     start_combat(game_state)
+    save_game(game_state, SAVE_FILE)
 
     initiative_names = []
     for char_id in game_state.initiative_order:
@@ -149,14 +210,11 @@ def start_game(game_id: str, request: Request) -> StartGameResponse:
     )
 
 
-@router.get("/{game_id}")
-def get_game(game_id: str, request: Request) -> dict:
+@router.get("")
+def get_game(request: Request) -> dict:
     """Get game metadata and status."""
-    games = _get_games(request)
-    if game_id not in games:
-        raise HTTPException(status_code=404, detail="Game not found")
+    game_state = _get_game(request)
 
-    game_state = games[game_id]
     characters_summary = []
     for char in game_state.characters.values():
         characters_summary.append({

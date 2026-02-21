@@ -4,33 +4,27 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
-from engine.combat import get_current_turn_character, process_action
+from config import SAVE_FILE
+from engine.combat import get_current_turn_character, process_action, save_game
 from models.actions import ActionRequest, ActionResult, ActionType, TurnState
-from models.game_state import GameStatus
+from models.game_state import GameState, GameStatus
 
 router = APIRouter()
 
 
-def _get_games(request: Request) -> dict:
-    """Get the games store from app state."""
-    return request.app.state.games
+def _get_game(request: Request) -> GameState:
+    """Get the singleton game from app state."""
+    return request.app.state.game
 
 
-@router.get("/{game_id}/state")
+@router.get("/state")
 def get_game_state(
-    game_id: str,
     request: Request,
     character_id: str = Query(..., description="Your character's ID"),
 ) -> dict:
-    """Get current game state from a specific character's perspective.
+    """Get current game state from a specific character's perspective."""
+    game_state = _get_game(request)
 
-    Returns a TurnState-like object with the character's view of the battlefield.
-    """
-    games = _get_games(request)
-    if game_id not in games:
-        raise HTTPException(status_code=404, detail="Game not found")
-
-    game_state = games[game_id]
     if character_id not in game_state.characters:
         raise HTTPException(status_code=404, detail="Character not found in this game")
 
@@ -58,7 +52,7 @@ def get_game_state(
     is_my_turn = current is not None and current.id == character_id
 
     return {
-        "game_id": game_id,
+        "game_id": game_state.game_id,
         "status": game_state.status.value,
         "round_number": game_state.round_number,
         "is_your_turn": is_my_turn,
@@ -70,21 +64,14 @@ def get_game_state(
     }
 
 
-@router.post("/{game_id}/action", response_model=ActionResult)
+@router.post("/action", response_model=ActionResult)
 def submit_action(
-    game_id: str,
     action: ActionRequest,
     request: Request,
 ) -> ActionResult:
-    """Submit an action for the current turn.
+    """Submit an action for the current turn."""
+    game_state = _get_game(request)
 
-    Returns 400 if it's not this character's turn or the action is invalid.
-    """
-    games = _get_games(request)
-    if game_id not in games:
-        raise HTTPException(status_code=404, detail="Game not found")
-
-    game_state = games[game_id]
     if game_state.status != GameStatus.ACTIVE:
         raise HTTPException(
             status_code=400,
@@ -103,15 +90,12 @@ def submit_action(
     if not result.success:
         raise HTTPException(status_code=400, detail=result.error)
 
+    save_game(game_state, SAVE_FILE)
     return result
 
 
-@router.get("/{game_id}/log")
-def get_game_log(game_id: str, request: Request) -> list[dict]:
+@router.get("/log")
+def get_game_log(request: Request) -> list[dict]:
     """Get the full event log for spectators/replay."""
-    games = _get_games(request)
-    if game_id not in games:
-        raise HTTPException(status_code=404, detail="Game not found")
-
-    game_state = games[game_id]
+    game_state = _get_game(request)
     return [event.model_dump() for event in game_state.event_log]

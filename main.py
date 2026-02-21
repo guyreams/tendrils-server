@@ -5,6 +5,8 @@ from fastapi import FastAPI
 from api.lobby import router as lobby_router
 from api.game import router as game_router
 from api.ws import router as ws_router
+from config import GAME_ID, GAME_NAME, SAVE_FILE
+from engine.combat import create_game, load_game
 
 app = FastAPI(
     title="Tendrils Server",
@@ -12,12 +14,16 @@ app = FastAPI(
     version="0.1.0",
 )
 
-# In-memory game store
-app.state.games = {}
+# Load or create the singleton game
+loaded = load_game(SAVE_FILE)
+if loaded is not None:
+    app.state.game = loaded
+else:
+    app.state.game = create_game(GAME_ID, name=GAME_NAME)
 
-app.include_router(lobby_router, prefix="/games", tags=["Lobby"])
-app.include_router(game_router, prefix="/games", tags=["Game"])
-app.include_router(ws_router, prefix="/games", tags=["WebSocket"])
+app.include_router(lobby_router, prefix="/game", tags=["Lobby"])
+app.include_router(game_router, prefix="/game", tags=["Game"])
+app.include_router(ws_router, prefix="/game", tags=["WebSocket"])
 
 
 @app.get("/")

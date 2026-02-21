@@ -5,3 +5,5 @@ __pycache__/
 .pytest_cache/
 .claude/
 tendrils-server-instructions.md
+game_state.json
+game_state.json.tmp
