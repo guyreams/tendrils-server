@@ -7,7 +7,18 @@ import tempfile
 import pytest
 from fastapi.testclient import TestClient
 
-from auth import User, _tokens, create_token, get_user_by_token, load_tokens, save_tokens
+from auth import (
+    User,
+    _tokens,
+    create_token,
+    delete_token,
+    get_token_for_owner,
+    get_user_by_token,
+    load_tokens,
+    rotate_token,
+    save_tokens,
+    update_user,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -296,3 +307,315 @@ class TestOwnershipEnforcement:
         )
         assert resp.status_code == 200
         assert resp.json()["your_character"]["id"] == setup["char_b_id"]
+
+
+class TestTokenHelpers:
+    """Tests for delete_token / update_user / get_token_for_owner / rotate_token."""
+
+    def test_delete_token_success(self):
+        create_token("bot_a", "Bot A")
+        assert delete_token("bot_a") is True
+        assert len(_tokens) == 0
+
+    def test_delete_token_not_found(self):
+        assert delete_token("nonexistent") is False
+
+    def test_delete_token_persists(self, tmp_path):
+        path = str(tmp_path / "tokens.json")
+        load_tokens(path)
+        key = create_token("bot_a", "Bot A")
+        save_tokens(path)
+        delete_token("bot_a")
+        save_tokens(path)
+
+        _tokens.clear()
+        loaded = load_tokens(path)
+        assert key not in loaded
+        assert len(loaded) == 0
+
+    def test_update_user_success(self):
+        create_token("bot_a", "Bot A")
+        assert update_user("bot_a", "New Name") is True
+        for user in _tokens.values():
+            if user.owner_id == "bot_a":
+                assert user.name == "New Name"
+
+    def test_update_user_not_found(self):
+        assert update_user("nonexistent", "Name") is False
+
+    def test_update_user_persists(self, tmp_path):
+        path = str(tmp_path / "tokens.json")
+        load_tokens(path)
+        key = create_token("bot_a", "Bot A")
+        save_tokens(path)
+        update_user("bot_a", "Updated")
+        save_tokens(path)
+
+        _tokens.clear()
+        loaded = load_tokens(path)
+        assert loaded[key].name == "Updated"
+
+    def test_get_token_for_owner_success(self):
+        key = create_token("bot_a", "Bot A")
+        assert get_token_for_owner("bot_a") == key
+
+    def test_get_token_for_owner_not_found(self):
+        assert get_token_for_owner("nonexistent") is None
+
+    def test_rotate_token_success(self):
+        old_key = create_token("bot_a", "Bot A")
+        new_key = rotate_token("bot_a")
+        assert new_key is not None
+        assert new_key != old_key
+        assert new_key.startswith("sk_")
+        assert old_key not in _tokens
+        assert new_key in _tokens
+        assert _tokens[new_key].owner_id == "bot_a"
+        assert _tokens[new_key].name == "Bot A"
+
+    def test_rotate_token_not_found(self):
+        assert rotate_token("nonexistent") is None
+
+    def test_rotate_token_old_key_invalid(self):
+        old_key = create_token("bot_a", "Bot A")
+        rotate_token("bot_a")
+        assert get_user_by_token(old_key) is None
+
+    def test_rotate_token_persists(self, tmp_path):
+        path = str(tmp_path / "tokens.json")
+        load_tokens(path)
+        old_key = create_token("bot_a", "Bot A")
+        save_tokens(path)
+        new_key = rotate_token("bot_a")
+        save_tokens(path)
+
+        _tokens.clear()
+        loaded = load_tokens(path)
+        assert old_key not in loaded
+        assert new_key in loaded
+
+
+ADMIN_HEADERS = {"X-Admin-Secret": "change-me-in-production"}
+
+
+class TestAdminCRUD:
+    """Tests for the admin CRUD endpoints (get-token, edit, rotate, delete)."""
+
+    @pytest.fixture
+    def client(self, tmp_path):
+        """Create a test client with a temporary token store."""
+        import auth
+        import config
+        old_tokens_file = config.TOKENS_FILE
+        config.TOKENS_FILE = str(tmp_path / "tokens.json")
+        auth.TOKENS_FILE = config.TOKENS_FILE
+
+        from main import app
+        load_tokens(config.TOKENS_FILE)
+        yield TestClient(app)
+
+        config.TOKENS_FILE = old_tokens_file
+        auth.TOKENS_FILE = old_tokens_file
+
+    def _register(self, client, owner_id: str, name: str) -> str:
+        """Register a user and return the API key."""
+        resp = client.post(
+            "/admin/register",
+            json={"owner_id": owner_id, "name": name},
+            headers=ADMIN_HEADERS,
+        )
+        return resp.json()["api_key"]
+
+    def _join(self, client, key: str, name: str = "Fighter") -> str:
+        """Join the game with a character and return the character_id."""
+        resp = client.post(
+            "/game/join",
+            json={
+                "name": name,
+                "max_hp": 20,
+                "armor_class": 15,
+                "attacks": [{
+                    "name": "Sword",
+                    "attack_bonus": 5,
+                    "damage_dice": "1d8",
+                    "damage_bonus": 3,
+                    "damage_type": "slashing",
+                }],
+            },
+            headers={"Authorization": f"Bearer {key}"},
+        )
+        return resp.json()["character_id"]
+
+    # ── GET /admin/users/{owner_id}/token ──
+
+    def test_get_token_success(self, client):
+        key = self._register(client, "bot_a", "Bot A")
+        resp = client.get("/admin/users/bot_a/token", headers=ADMIN_HEADERS)
+        assert resp.status_code == 200
+        assert resp.json()["api_key"] == key
+        assert resp.json()["owner_id"] == "bot_a"
+
+    def test_get_token_not_found(self, client):
+        resp = client.get("/admin/users/nonexistent/token", headers=ADMIN_HEADERS)
+        assert resp.status_code == 404
+
+    def test_get_token_wrong_secret(self, client):
+        resp = client.get(
+            "/admin/users/bot_a/token",
+            headers={"X-Admin-Secret": "wrong"},
+        )
+        assert resp.status_code == 403
+
+    # ── PATCH /admin/users/{owner_id} ──
+
+    def test_edit_user_success(self, client):
+        self._register(client, "bot_a", "Bot A")
+        resp = client.patch(
+            "/admin/users/bot_a",
+            json={"name": "New Name"},
+            headers=ADMIN_HEADERS,
+        )
+        assert resp.status_code == 200
+        assert resp.json()["owner_id"] == "bot_a"
+        assert resp.json()["name"] == "New Name"
+
+        # Verify it persisted to user list
+        users_resp = client.get("/admin/users", headers=ADMIN_HEADERS)
+        users = users_resp.json()
+        bot_a = next(u for u in users if u["owner_id"] == "bot_a")
+        assert bot_a["name"] == "New Name"
+
+    def test_edit_user_not_found(self, client):
+        resp = client.patch(
+            "/admin/users/nonexistent",
+            json={"name": "Name"},
+            headers=ADMIN_HEADERS,
+        )
+        assert resp.status_code == 404
+
+    def test_edit_user_wrong_secret(self, client):
+        resp = client.patch(
+            "/admin/users/bot_a",
+            json={"name": "Name"},
+            headers={"X-Admin-Secret": "wrong"},
+        )
+        assert resp.status_code == 403
+
+    # ── POST /admin/users/{owner_id}/rotate-token ──
+
+    def test_rotate_token_success(self, client):
+        old_key = self._register(client, "bot_a", "Bot A")
+        resp = client.post("/admin/users/bot_a/rotate-token", headers=ADMIN_HEADERS)
+        assert resp.status_code == 200
+        new_key = resp.json()["api_key"]
+        assert new_key != old_key
+        assert new_key.startswith("sk_")
+
+        # Old key should be rejected
+        resp2 = client.get(
+            "/game/state",
+            headers={"Authorization": f"Bearer {old_key}"},
+        )
+        assert resp2.status_code == 401
+
+        # New key should work
+        resp3 = client.get(
+            "/game",
+            headers={"Authorization": f"Bearer {new_key}"},
+        )
+        assert resp3.status_code == 200
+
+    def test_rotate_token_not_found(self, client):
+        resp = client.post("/admin/users/nonexistent/rotate-token", headers=ADMIN_HEADERS)
+        assert resp.status_code == 404
+
+    def test_rotate_token_wrong_secret(self, client):
+        resp = client.post(
+            "/admin/users/bot_a/rotate-token",
+            headers={"X-Admin-Secret": "wrong"},
+        )
+        assert resp.status_code == 403
+
+    # ── DELETE /admin/users/{owner_id} ──
+
+    def test_delete_user_success(self, client):
+        self._register(client, "bot_a", "Bot A")
+        resp = client.delete("/admin/users/bot_a", headers=ADMIN_HEADERS)
+        assert resp.status_code == 200
+        assert resp.json()["message"] == "User 'bot_a' deleted"
+
+        # Verify user is gone from the list
+        users_resp = client.get("/admin/users", headers=ADMIN_HEADERS)
+        owner_ids = [u["owner_id"] for u in users_resp.json()]
+        assert "bot_a" not in owner_ids
+
+    def test_delete_user_not_found(self, client):
+        resp = client.delete("/admin/users/nonexistent", headers=ADMIN_HEADERS)
+        assert resp.status_code == 404
+
+    def test_delete_user_wrong_secret(self, client):
+        resp = client.delete(
+            "/admin/users/bot_a",
+            headers={"X-Admin-Secret": "wrong"},
+        )
+        assert resp.status_code == 403
+
+    def test_delete_user_with_no_character(self, client):
+        """Deleting a user who never joined should report character_removed=false."""
+        self._register(client, "bot_a", "Bot A")
+        resp = client.delete("/admin/users/bot_a", headers=ADMIN_HEADERS)
+        assert resp.status_code == 200
+        assert resp.json()["character_removed"] is False
+
+    def test_delete_user_removes_character(self, client):
+        """Deleting a user should remove their character from the game."""
+        key = self._register(client, "bot_a", "Bot A")
+        self._join(client, key, "Fighter A")
+
+        # Confirm character is in the game
+        game = client.get("/game").json()
+        assert any(c["name"] == "Fighter A" for c in game["characters"])
+
+        resp = client.delete("/admin/users/bot_a", headers=ADMIN_HEADERS)
+        assert resp.status_code == 200
+        assert resp.json()["character_removed"] is True
+
+        # Character should be gone
+        game = client.get("/game").json()
+        assert not any(c.get("owner_id") == "bot_a" for c in game["characters"])
+
+    def test_delete_user_token_invalidated(self, client):
+        """After deleting a user, their API key should be rejected."""
+        key = self._register(client, "bot_a", "Bot A")
+        client.delete("/admin/users/bot_a", headers=ADMIN_HEADERS)
+
+        resp = client.get(
+            "/game/state",
+            headers={"Authorization": f"Bearer {key}"},
+        )
+        assert resp.status_code == 401
+
+    def test_rotate_then_join(self, client):
+        """After rotating a key, the new key should work for joining."""
+        self._register(client, "bot_a", "Bot A")
+        resp = client.post("/admin/users/bot_a/rotate-token", headers=ADMIN_HEADERS)
+        new_key = resp.json()["api_key"]
+
+        join_resp = client.post(
+            "/game/join",
+            json={
+                "name": "Rotated Fighter",
+                "max_hp": 20,
+                "armor_class": 15,
+                "attacks": [{
+                    "name": "Sword",
+                    "attack_bonus": 5,
+                    "damage_dice": "1d8",
+                    "damage_bonus": 3,
+                    "damage_type": "slashing",
+                }],
+            },
+            headers={"Authorization": f"Bearer {new_key}"},
+        )
+        assert join_resp.status_code == 200
+        assert "character_id" in join_resp.json()

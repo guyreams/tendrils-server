@@ -1,10 +1,20 @@
 """Admin endpoints for user registration and API key management."""
 
-from fastapi import APIRouter, HTTPException, Header
+from fastapi import APIRouter, HTTPException, Header, Request
 from pydantic import BaseModel
 
-from auth import User, _tokens, create_token
-from config import ADMIN_SECRET
+from auth import (
+    User,
+    _tokens,
+    create_token,
+    delete_token,
+    update_user,
+    get_token_for_owner,
+    rotate_token,
+)
+from config import ADMIN_SECRET, SAVE_FILE
+from engine.combat import save_game, end_combat
+from models.game_state import GameStatus
 
 router = APIRouter()
 
@@ -19,6 +29,23 @@ class RegisterResponse(BaseModel):
     """Response after registering a new user."""
     api_key: str
     owner_id: str
+
+
+class UpdateUserRequest(BaseModel):
+    """Request body for updating user details."""
+    name: str
+
+
+class UpdateUserResponse(BaseModel):
+    """Response after updating a user."""
+    owner_id: str
+    name: str
+
+
+class DeleteUserResponse(BaseModel):
+    """Response after deleting a user."""
+    message: str
+    character_removed: bool
 
 
 @router.post("/register", response_model=RegisterResponse)
@@ -56,3 +83,123 @@ def list_users(
         {"owner_id": user.owner_id, "name": user.name}
         for user in _tokens.values()
     ]
+
+
+@router.get("/users/{owner_id}/token", response_model=RegisterResponse)
+def get_user_token(
+    owner_id: str,
+    x_admin_secret: str = Header(..., alias="X-Admin-Secret"),
+) -> RegisterResponse:
+    """Retrieve the API key for a specific user.
+
+    Requires the X-Admin-Secret header.
+    """
+    if x_admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid admin secret")
+
+    api_key = get_token_for_owner(owner_id)
+    if api_key is None:
+        raise HTTPException(status_code=404, detail=f"owner_id '{owner_id}' not found")
+
+    return RegisterResponse(api_key=api_key, owner_id=owner_id)
+
+
+@router.patch("/users/{owner_id}", response_model=UpdateUserResponse)
+def edit_user(
+    owner_id: str,
+    body: UpdateUserRequest,
+    x_admin_secret: str = Header(..., alias="X-Admin-Secret"),
+) -> UpdateUserResponse:
+    """Update a user's display name.
+
+    Requires the X-Admin-Secret header.
+    """
+    if x_admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid admin secret")
+
+    updated = update_user(owner_id, body.name)
+    if not updated:
+        raise HTTPException(status_code=404, detail=f"owner_id '{owner_id}' not found")
+
+    return UpdateUserResponse(owner_id=owner_id, name=body.name)
+
+
+@router.post("/users/{owner_id}/rotate-token", response_model=RegisterResponse)
+def rotate_user_token(
+    owner_id: str,
+    x_admin_secret: str = Header(..., alias="X-Admin-Secret"),
+) -> RegisterResponse:
+    """Rotate the API key for an existing user. The old key is invalidated immediately.
+
+    Requires the X-Admin-Secret header.
+    """
+    if x_admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid admin secret")
+
+    new_key = rotate_token(owner_id)
+    if new_key is None:
+        raise HTTPException(status_code=404, detail=f"owner_id '{owner_id}' not found")
+
+    return RegisterResponse(api_key=new_key, owner_id=owner_id)
+
+
+@router.delete("/users/{owner_id}", response_model=DeleteUserResponse)
+def delete_user(
+    owner_id: str,
+    request: Request,
+    x_admin_secret: str = Header(..., alias="X-Admin-Secret"),
+) -> DeleteUserResponse:
+    """Delete a user, their API key, and any in-game character.
+
+    Requires the X-Admin-Secret header.
+    """
+    if x_admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid admin secret")
+
+    deleted = delete_token(owner_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"owner_id '{owner_id}' not found")
+
+    # Clean up any character belonging to this owner in the game
+    character_removed = False
+    game_state = request.app.state.game
+    char_to_remove = None
+    for char in game_state.characters.values():
+        if char.owner_id == owner_id:
+            char_to_remove = char
+            break
+
+    if char_to_remove is not None:
+        # Clear grid cell
+        if char_to_remove.position is not None:
+            x, y = char_to_remove.position
+            if game_state.grid[y][x].occupant_id == char_to_remove.id:
+                game_state.grid[y][x].occupant_id = None
+        # Remove from initiative order if in active combat
+        if char_to_remove.id in game_state.initiative_order:
+            game_state.initiative_order.remove(char_to_remove.id)
+            if game_state.initiative_order:
+                game_state.current_turn_index = (
+                    game_state.current_turn_index % len(game_state.initiative_order)
+                )
+        # Remove from characters dict
+        del game_state.characters[char_to_remove.id]
+        character_removed = True
+
+        # Check if combat should end (fewer than 2 alive owners)
+        if game_state.status == GameStatus.ACTIVE:
+            alive_owners = {
+                c.owner_id for c in game_state.characters.values() if c.is_alive
+            }
+            if len(alive_owners) <= 1:
+                if alive_owners:
+                    game_state.winner_id = alive_owners.pop()
+                game_state.status = GameStatus.COMPLETED
+                end_combat(game_state)
+
+        save_game(game_state, SAVE_FILE)
+
+    return DeleteUserResponse(
+        message=f"User '{owner_id}' deleted",
+        character_removed=character_removed,
+    )
