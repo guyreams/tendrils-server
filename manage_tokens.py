@@ -88,8 +88,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Manage Tendrils Server API keys",
     )
-    parser.add_argument(
-        "--url",
+
+    url_kwargs = dict(
         default=DEFAULT_URL,
         help=f"Server URL (default: {DEFAULT_URL}, or set TENDRILS_URL env var)",
     )
@@ -99,8 +99,10 @@ def main() -> None:
     create_parser = subparsers.add_parser("create", help="Register a new user")
     create_parser.add_argument("--owner", required=True, help="Unique owner_id for the bot")
     create_parser.add_argument("--name", required=True, help="Display name for the user")
+    create_parser.add_argument("--url", **url_kwargs)
 
-    subparsers.add_parser("list", help="List all registered users")
+    list_parser = subparsers.add_parser("list", help="List all registered users")
+    list_parser.add_argument("--url", **url_kwargs)
 
     args = parser.parse_args()
 
