@@ -6,7 +6,8 @@ from api.lobby import router as lobby_router
 from api.game import router as game_router
 from api.ws import router as ws_router
 from config import GAME_ID, GAME_NAME, SAVE_FILE
-from engine.combat import create_game, load_game
+from engine.combat import create_game, end_combat, load_game, save_game
+from models.game_state import GameStatus
 
 app = FastAPI(
     title="Tendrils Server",
@@ -18,6 +19,10 @@ app = FastAPI(
 loaded = load_game(SAVE_FILE)
 if loaded is not None:
     app.state.game = loaded
+    # If the server restarts while in COMPLETED state, transition to WAITING
+    if loaded.status == GameStatus.COMPLETED:
+        end_combat(loaded)
+        save_game(loaded, SAVE_FILE)
 else:
     app.state.game = create_game(GAME_ID, name=GAME_NAME)
 

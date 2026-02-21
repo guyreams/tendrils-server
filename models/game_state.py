@@ -45,4 +45,5 @@ class GameState(BaseModel):
     round_number: int = 1
     turn_deadline: datetime | None = None
     event_log: list[GameEvent] = []
+    combat_log_history: list[list[GameEvent]] = []  # Past combat logs
     winner_id: str | None = None

@@ -61,6 +61,7 @@ def get_game_state(
         "available_actions": [a.value for a in available_actions],
         "turn_deadline": game_state.turn_deadline.isoformat() if game_state.turn_deadline else None,
         "winner_id": game_state.winner_id,
+        "past_combats": len(game_state.combat_log_history),
     }
 
 
@@ -96,6 +97,16 @@ def submit_action(
 
 @router.get("/log")
 def get_game_log(request: Request) -> list[dict]:
-    """Get the full event log for spectators/replay."""
+    """Get the event log for the current or most recent combat."""
     game_state = _get_game(request)
     return [event.model_dump() for event in game_state.event_log]
+
+
+@router.get("/history")
+def get_combat_history(request: Request) -> list[list[dict]]:
+    """Get archived logs from all past combats."""
+    game_state = _get_game(request)
+    return [
+        [event.model_dump() for event in combat]
+        for combat in game_state.combat_log_history
+    ]

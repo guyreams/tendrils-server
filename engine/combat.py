@@ -102,6 +102,7 @@ def start_combat(game_state: GameState) -> GameState:
     )
     game_state.initiative_order = [c.id for c in sorted_chars]
     game_state.current_turn_index = 0
+    game_state.winner_id = None
     game_state.status = GameStatus.ACTIVE
     game_state.turn_deadline = _new_deadline()
 
@@ -272,6 +273,9 @@ def process_action(
         if winner:
             game_state.winner_id = winner
             game_state.status = GameStatus.COMPLETED
+            # Auto-transition: clean up and return to WAITING so the
+            # world persists and new characters can join the survivors.
+            end_combat(game_state)
         else:
             advance_turn(game_state)
 
@@ -354,6 +358,30 @@ def remove_dead_characters(game_state: GameState) -> None:
             if game_state.grid[y][x].occupant_id == cid:
                 game_state.grid[y][x].occupant_id = None
         del game_state.characters[cid]
+
+
+def end_combat(game_state: GameState) -> None:
+    """Transition from COMPLETED back to WAITING after combat ends.
+
+    The world persists: dead characters are removed, survivors keep their
+    state, and the combat log is archived into history. The game returns
+    to WAITING so new characters can join and start a fresh combat round.
+
+    Args:
+        game_state: Current game state (mutated in place).
+    """
+    remove_dead_characters(game_state)
+
+    # Archive the current combat log
+    if game_state.event_log:
+        game_state.combat_log_history.append(list(game_state.event_log))
+        game_state.event_log = []
+
+    game_state.initiative_order = []
+    game_state.current_turn_index = 0
+    game_state.round_number = 1
+    game_state.turn_deadline = None
+    game_state.status = GameStatus.WAITING
 
 
 def transition_to_waiting(game_state: GameState) -> None:

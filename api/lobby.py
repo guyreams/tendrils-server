@@ -10,7 +10,6 @@ from engine.combat import (
     add_character,
     save_game,
     start_combat,
-    transition_to_waiting,
 )
 from models.characters import AbilityScores, Attack, Character
 from models.game_state import GameState, GameStatus
@@ -110,10 +109,6 @@ def join_game(body: JoinGameRequest, request: Request) -> JoinGameResponse:
     - If owner_id is new: create a new character.
     """
     game_state = _get_game(request)
-
-    # Auto-transition from COMPLETED to WAITING
-    if game_state.status == GameStatus.COMPLETED:
-        transition_to_waiting(game_state)
 
     if game_state.status != GameStatus.WAITING:
         raise HTTPException(
@@ -236,4 +231,5 @@ def get_game(request: Request) -> dict:
         "initiative_order": game_state.initiative_order,
         "current_turn_index": game_state.current_turn_index,
         "winner_id": game_state.winner_id,
+        "past_combats": len(game_state.combat_log_history),
     }
