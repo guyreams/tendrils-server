@@ -1,0 +1,340 @@
+"""Combat orchestration: game creation, turns, initiative, win conditions."""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from config import GRID_HEIGHT, GRID_WIDTH, TURN_TIMEOUT_SECONDS
+from engine.dice import roll
+from engine.grid import (
+    create_grid,
+    distance,
+    get_valid_moves,
+    is_adjacent,
+    move_character,
+)
+from engine.rules import resolve_attack, roll_initiative, validate_action
+from models.actions import ActionRequest, ActionResult, ActionType
+from models.characters import Character
+from models.game_state import GameEvent, GameState, GameStatus
+
+
+def create_game(game_id: str, name: str = "Arena") -> GameState:
+    """Initialize a new game with an empty grid.
+
+    Args:
+        game_id: Unique identifier for the game.
+        name: Display name for the game.
+
+    Returns:
+        A fresh GameState ready for players to join.
+    """
+    grid = create_grid(GRID_WIDTH, GRID_HEIGHT)
+    return GameState(
+        game_id=game_id,
+        name=name,
+        grid=grid,
+    )
+
+
+def add_character(
+    game_state: GameState,
+    character: Character,
+    starting_position: tuple[int, int],
+) -> GameState:
+    """Place a character on the grid and add them to the game.
+
+    Args:
+        game_state: Current game state.
+        character: The character to add.
+        starting_position: (x, y) position to place the character.
+
+    Returns:
+        Updated game state.
+
+    Raises:
+        ValueError: If the position is invalid or occupied.
+    """
+    x, y = starting_position
+    if y < 0 or y >= len(game_state.grid) or x < 0 or x >= len(game_state.grid[0]):
+        raise ValueError(f"Position ({x}, {y}) is out of bounds")
+
+    cell = game_state.grid[y][x]
+    if cell.occupant_id is not None:
+        raise ValueError(f"Position ({x}, {y}) is already occupied")
+    if cell.terrain == "wall":
+        raise ValueError(f"Position ({x}, {y}) is a wall")
+
+    character.position = starting_position
+    cell.occupant_id = character.id
+    game_state.characters[character.id] = character
+
+    return game_state
+
+
+def start_combat(game_state: GameState) -> GameState:
+    """Roll initiative for all characters and begin combat.
+
+    Args:
+        game_state: Current game state.
+
+    Returns:
+        Updated game state with initiative order and ACTIVE status.
+
+    Raises:
+        ValueError: If fewer than 2 characters are in the game.
+    """
+    if len(game_state.characters) < 2:
+        raise ValueError("Need at least 2 characters to start combat")
+
+    # Roll initiative for each character
+    for char in game_state.characters.values():
+        char.initiative = roll_initiative(char)
+
+    # Sort by initiative (descending), then by dex score as tiebreaker
+    sorted_chars = sorted(
+        game_state.characters.values(),
+        key=lambda c: (c.initiative, c.ability_scores.dexterity),
+        reverse=True,
+    )
+    game_state.initiative_order = [c.id for c in sorted_chars]
+    game_state.current_turn_index = 0
+    game_state.status = GameStatus.ACTIVE
+    game_state.turn_deadline = _new_deadline()
+
+    return game_state
+
+
+def get_current_turn_character(game_state: GameState) -> Character | None:
+    """Get the character whose turn it currently is.
+
+    Args:
+        game_state: Current game state.
+
+    Returns:
+        The current turn's character, or None if game isn't active.
+    """
+    if game_state.status != GameStatus.ACTIVE:
+        return None
+    if not game_state.initiative_order:
+        return None
+    char_id = game_state.initiative_order[game_state.current_turn_index]
+    return game_state.characters.get(char_id)
+
+
+def process_action(
+    game_state: GameState,
+    character_id: str,
+    action: ActionRequest,
+) -> tuple[GameState, ActionResult]:
+    """Validate and resolve an action, advancing the turn if appropriate.
+
+    Args:
+        game_state: Current game state.
+        character_id: ID of the acting character.
+        action: The requested action.
+
+    Returns:
+        (updated_game_state, action_result) tuple.
+    """
+    character = game_state.characters.get(character_id)
+    if character is None:
+        return game_state, ActionResult(
+            success=False,
+            action_type=action.action_type,
+            description="Character not found",
+            error="Character not found",
+        )
+
+    # Validate it's this character's turn
+    current = get_current_turn_character(game_state)
+    if current is None or current.id != character_id:
+        return game_state, ActionResult(
+            success=False,
+            action_type=action.action_type,
+            description="It's not your turn",
+            error="It's not your turn",
+        )
+
+    # Validate the action
+    valid, error = validate_action(
+        action.action_type,
+        character,
+        game_state,
+        target_id=action.target_id,
+        target_position=action.target_position,
+        weapon_name=action.weapon_name,
+    )
+    if not valid:
+        return game_state, ActionResult(
+            success=False,
+            action_type=action.action_type,
+            description=error,
+            error=error,
+        )
+
+    result: ActionResult
+
+    # --- MOVE ---
+    if action.action_type == ActionType.MOVE:
+        try:
+            path = move_character(character_id, action.target_position, game_state)
+            result = ActionResult(
+                success=True,
+                action_type=ActionType.MOVE,
+                description=f"{character.name} moves to {action.target_position}.",
+                movement_path=path,
+            )
+        except ValueError as e:
+            result = ActionResult(
+                success=False,
+                action_type=ActionType.MOVE,
+                description=str(e),
+                error=str(e),
+            )
+
+    # --- ATTACK ---
+    elif action.action_type == ActionType.ATTACK:
+        target = game_state.characters[action.target_id]
+        # Find weapon
+        weapon = character.attacks[0]
+        if action.weapon_name:
+            for atk in character.attacks:
+                if atk.name.lower() == action.weapon_name.lower():
+                    weapon = atk
+                    break
+        result = resolve_attack(character, target, weapon, game_state)
+
+    # --- DODGE ---
+    elif action.action_type == ActionType.DODGE:
+        if "dodging" not in character.conditions:
+            character.conditions.append("dodging")
+        result = ActionResult(
+            success=True,
+            action_type=ActionType.DODGE,
+            description=f"{character.name} takes the Dodge action. Attacks against them have disadvantage.",
+        )
+
+    # --- DASH ---
+    elif action.action_type == ActionType.DASH:
+        result = ActionResult(
+            success=True,
+            action_type=ActionType.DASH,
+            description=f"{character.name} takes the Dash action, gaining {character.speed}ft extra movement.",
+        )
+
+    # --- DISENGAGE ---
+    elif action.action_type == ActionType.DISENGAGE:
+        result = ActionResult(
+            success=True,
+            action_type=ActionType.DISENGAGE,
+            description=f"{character.name} takes the Disengage action.",
+        )
+
+    # --- END TURN ---
+    elif action.action_type == ActionType.END_TURN:
+        result = ActionResult(
+            success=True,
+            action_type=ActionType.END_TURN,
+            description=f"{character.name} ends their turn.",
+        )
+    else:
+        result = ActionResult(
+            success=False,
+            action_type=action.action_type,
+            description="Unknown action type",
+            error="Unknown action type",
+        )
+
+    # Log the event
+    if result.success:
+        event = GameEvent(
+            round=game_state.round_number,
+            character_id=character_id,
+            action_type=action.action_type.value,
+            description=result.description,
+            details={
+                "attack_roll": result.attack_roll,
+                "hit": result.hit,
+                "damage_dealt": result.damage_dealt,
+            },
+            timestamp=datetime.now(timezone.utc),
+        )
+        game_state.event_log.append(event)
+
+    # Advance turn on action completion (except MOVE — movement doesn't end turn)
+    if result.success and action.action_type not in (ActionType.MOVE,):
+        # Check win condition first
+        winner = check_win_condition(game_state)
+        if winner:
+            game_state.winner_id = winner
+            game_state.status = GameStatus.COMPLETED
+        else:
+            advance_turn(game_state)
+
+    return game_state, result
+
+
+def advance_turn(game_state: GameState) -> GameState:
+    """Move to the next character in initiative order.
+
+    Skips dead characters. Increments round if wrapped.
+
+    Args:
+        game_state: Current game state.
+
+    Returns:
+        Updated game state.
+    """
+    if not game_state.initiative_order:
+        return game_state
+
+    # Clear dodging condition from the character whose turn just ended
+    current = get_current_turn_character(game_state)
+    if current and "dodging" in current.conditions:
+        current.conditions.remove("dodging")
+
+    order_len = len(game_state.initiative_order)
+    attempts = 0
+    while attempts < order_len:
+        game_state.current_turn_index = (
+            (game_state.current_turn_index + 1) % order_len
+        )
+        if game_state.current_turn_index == 0:
+            game_state.round_number += 1
+
+        next_char_id = game_state.initiative_order[game_state.current_turn_index]
+        next_char = game_state.characters.get(next_char_id)
+        if next_char and next_char.is_alive:
+            break
+        attempts += 1
+
+    game_state.turn_deadline = _new_deadline()
+    return game_state
+
+
+def check_win_condition(game_state: GameState) -> str | None:
+    """Check if only one team has living characters.
+
+    Args:
+        game_state: Current game state.
+
+    Returns:
+        The winner's owner_id if there's a winner, else None.
+    """
+    alive_owners: set[str] = set()
+    for char in game_state.characters.values():
+        if char.is_alive:
+            alive_owners.add(char.owner_id)
+
+    if len(alive_owners) == 1:
+        return alive_owners.pop()
+    if len(alive_owners) == 0:
+        return None  # Everyone is dead — draw
+    return None
+
+
+def _new_deadline() -> datetime:
+    """Generate a new turn deadline from now."""
+    from datetime import timedelta
+    return datetime.now(timezone.utc) + timedelta(seconds=TURN_TIMEOUT_SECONDS)
