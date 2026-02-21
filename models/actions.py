@@ -20,7 +20,7 @@ class ActionType(str, Enum):
 
 class ActionRequest(BaseModel):
     """A bot's requested action."""
-    character_id: str
+    character_id: str | None = None     # Server-injected from auth; clients should not send this
     action_type: ActionType
     target_id: str | None = None        # For attacks
     target_position: tuple[int, int] | None = None  # For movement

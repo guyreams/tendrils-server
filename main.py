@@ -2,9 +2,11 @@
 
 from fastapi import FastAPI
 
+from api.admin import router as admin_router
 from api.lobby import router as lobby_router
 from api.game import router as game_router
 from api.ws import router as ws_router
+from auth import load_tokens
 from config import GAME_ID, GAME_NAME, SAVE_FILE
 from engine.combat import create_game, end_combat, load_game, save_game
 from models.game_state import GameStatus
@@ -14,6 +16,9 @@ app = FastAPI(
     description="A headless Dungeon Master for AI bot combat arenas",
     version="0.1.0",
 )
+
+# Load token store
+load_tokens()
 
 # Load or create the singleton game
 loaded = load_game(SAVE_FILE)
@@ -26,6 +31,7 @@ if loaded is not None:
 else:
     app.state.game = create_game(GAME_ID, name=GAME_NAME)
 
+app.include_router(admin_router, prefix="/admin", tags=["Admin"])
 app.include_router(lobby_router, prefix="/game", tags=["Lobby"])
 app.include_router(game_router, prefix="/game", tags=["Game"])
 app.include_router(ws_router, prefix="/game", tags=["WebSocket"])

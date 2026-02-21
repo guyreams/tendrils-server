@@ -1,7 +1,7 @@
 """Reference bot that plays Tendrils Server via the REST API.
 
-Joins a Fighter and a Rogue to the single persistent game, starts combat,
-and plays each turn by picking simple tactical actions:
+Registers two users, joins a Fighter and a Rogue to the single persistent
+game, starts combat, and plays each turn by picking simple tactical actions:
   - If an enemy is adjacent, attack.
   - If an enemy is visible but not adjacent, move toward them.
   - Otherwise, end turn.
@@ -9,23 +9,63 @@ and plays each turn by picking simple tactical actions:
 Usage:
     1. Start the server:  uvicorn main:app --reload
     2. Run this bot:      python bots/example_bot.py
+
+Environment variables:
+    ADMIN_SECRET  — must match the server's admin secret (default: "change-me-in-production")
 """
 
+import os
 import sys
 import time
 
 import httpx
 
 BASE_URL = "http://127.0.0.1:8000"
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "change-me-in-production")
+
+
+def _register_user(client: httpx.Client, owner_id: str, name: str) -> str:
+    """Register a user and return their API key.
+
+    If the user already exists (409), this is not retried — the caller
+    should already have the key from a previous run.
+    """
+    resp = client.post(
+        "/admin/register",
+        json={"owner_id": owner_id, "name": name},
+        headers={"X-Admin-Secret": ADMIN_SECRET},
+    )
+    if resp.status_code == 409:
+        print(f"  {owner_id} already registered (restart server to reset tokens)")
+        sys.exit(1)
+    resp.raise_for_status()
+    return resp.json()["api_key"]
 
 
 def main() -> None:
     """Run a complete game between a Fighter and a Rogue."""
     client = httpx.Client(base_url=BASE_URL, timeout=10.0)
 
-    # 1. Join two characters
+    # 0. Register users and get API keys
+    print("Registering users...")
+    key_a = _register_user(client, "bot_a", "Bot A")
+    print(f"  bot_a key: {key_a[:12]}...")
+    key_b = _register_user(client, "bot_b", "Bot B")
+    print(f"  bot_b key: {key_b[:12]}...")
+
+    client_a = httpx.Client(
+        base_url=BASE_URL,
+        timeout=10.0,
+        headers={"Authorization": f"Bearer {key_a}"},
+    )
+    client_b = httpx.Client(
+        base_url=BASE_URL,
+        timeout=10.0,
+        headers={"Authorization": f"Bearer {key_b}"},
+    )
+
+    # 1. Join two characters (no owner_id needed — derived from token)
     fighter_data = {
-        "owner_id": "bot_a",
         "name": "Gruk the Fighter",
         "max_hp": 52,
         "armor_class": 18,
@@ -51,7 +91,6 @@ def main() -> None:
     }
 
     rogue_data = {
-        "owner_id": "bot_b",
         "name": "Silka the Rogue",
         "max_hp": 38,
         "armor_class": 15,
@@ -76,23 +115,23 @@ def main() -> None:
         ],
     }
 
-    print("Joining Fighter...")
-    resp = client.post("/game/join", json=fighter_data)
+    print("\nJoining Fighter...")
+    resp = client_a.post("/game/join", json=fighter_data)
     resp.raise_for_status()
     join_resp = resp.json()
     fighter_id = join_resp["character_id"]
     print(f"  Fighter ID: {fighter_id} — {join_resp['message']}")
 
     print("Joining Rogue...")
-    resp = client.post("/game/join", json=rogue_data)
+    resp = client_b.post("/game/join", json=rogue_data)
     resp.raise_for_status()
     join_resp = resp.json()
     rogue_id = join_resp["character_id"]
     print(f"  Rogue ID: {rogue_id} — {join_resp['message']}")
 
-    # 2. Start combat
+    # 2. Start combat (either authenticated player can start)
     print("\nStarting combat...")
-    resp = client.post("/game/start")
+    resp = client_a.post("/game/start")
     resp.raise_for_status()
     start_data = resp.json()
     print(f"  {start_data['message']}")
@@ -103,11 +142,12 @@ def main() -> None:
     print("\n--- COMBAT ---\n")
     max_rounds = 100
     turn_count = 0
+    bot_clients = [client_a, client_b]
 
     while turn_count < max_rounds * 2:
         turn_count += 1
 
-        # Check game status
+        # Check game status (public endpoint, no auth needed)
         resp = client.get("/game")
         resp.raise_for_status()
         game_info = resp.json()
@@ -117,11 +157,8 @@ def main() -> None:
             break
 
         # Try each bot's perspective to find whose turn it is
-        for char_id in [fighter_id, rogue_id]:
-            resp = client.get(
-                "/game/state",
-                params={"character_id": char_id},
-            )
+        for bot_client in bot_clients:
+            resp = bot_client.get("/game/state")
             resp.raise_for_status()
             state = resp.json()
 
@@ -141,7 +178,7 @@ def main() -> None:
 
             if not enemies:
                 # No enemies — end turn
-                _submit_action(client, char_id, "end_turn")
+                _submit_action(bot_client, "end_turn")
                 break
 
             enemy = enemies[0]
@@ -151,22 +188,18 @@ def main() -> None:
 
             if dist <= 5:
                 # Adjacent — attack!
-                _submit_action(
-                    client, char_id, "attack",
-                    target_id=enemy["id"],
-                )
+                _submit_action(bot_client, "attack", target_id=enemy["id"])
             else:
                 # Move toward enemy
                 dx = _sign(enemy_pos[0] - my_pos[0])
                 dy = _sign(enemy_pos[1] - my_pos[1])
                 target = (my_pos[0] + dx, my_pos[1] + dy)
                 success = _submit_action(
-                    client, char_id, "move",
-                    target_position=list(target),
+                    bot_client, "move", target_position=list(target),
                 )
                 if not success:
                     # Movement failed, just end turn
-                    _submit_action(client, char_id, "end_turn")
+                    _submit_action(bot_client, "end_turn")
 
             break
 
@@ -180,20 +213,18 @@ def main() -> None:
         print(f"  [Round {event['round']}] {event['description']}")
 
     client.close()
+    client_a.close()
+    client_b.close()
 
 
 def _submit_action(
     client: httpx.Client,
-    character_id: str,
     action_type: str,
     target_id: str | None = None,
     target_position: list[int] | None = None,
 ) -> bool:
     """Submit an action and print the result. Returns True if successful."""
-    payload: dict = {
-        "character_id": character_id,
-        "action_type": action_type,
-    }
+    payload: dict = {"action_type": action_type}
     if target_id:
         payload["target_id"] = target_id
     if target_position:

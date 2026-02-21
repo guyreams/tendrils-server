@@ -8,6 +8,7 @@ from typing import Any
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
+from auth import get_user_by_token
 from models.game_state import GameStatus
 
 router = APIRouter()
@@ -61,14 +62,32 @@ async def notify_game_over(winner_id: str | None) -> None:
 @router.websocket("/ws")
 async def websocket_endpoint(
     websocket: WebSocket,
-    character_id: str = Query(...),
+    token: str = Query(...),
 ) -> None:
     """WebSocket endpoint for real-time game notifications.
 
-    Clients connect and receive turn_start, action_result, and game_over messages.
+    Authenticate via the `token` query parameter (same API key used for REST).
+    The server resolves the user's character from the token.
     """
-    await websocket.accept()
+    # Authenticate
+    user = get_user_by_token(token)
+    if user is None:
+        await websocket.close(code=4001, reason="Invalid API key")
+        return
 
+    # Find the user's character
+    game_state = websocket.app.state.game
+    character_id = None
+    for char in game_state.characters.values():
+        if char.owner_id == user.owner_id:
+            character_id = char.id
+            break
+
+    if character_id is None:
+        await websocket.close(code=4002, reason="No character found for this user")
+        return
+
+    await websocket.accept()
     connections.append((character_id, websocket))
 
     try:

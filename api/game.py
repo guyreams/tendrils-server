@@ -2,8 +2,9 @@
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
+from auth import User, get_current_user
 from config import SAVE_FILE
 from engine.combat import get_current_turn_character, process_action, save_game
 from models.actions import ActionRequest, ActionResult, ActionType, TurnState
@@ -17,16 +18,25 @@ def _get_game(request: Request) -> GameState:
     return request.app.state.game
 
 
+def _find_character_by_owner(game_state: GameState, owner_id: str) -> str | None:
+    """Find the character_id belonging to an owner. Returns None if not found."""
+    for char in game_state.characters.values():
+        if char.owner_id == owner_id:
+            return char.id
+    return None
+
+
 @router.get("/state")
 def get_game_state(
     request: Request,
-    character_id: str = Query(..., description="Your character's ID"),
+    user: User = Depends(get_current_user),
 ) -> dict:
-    """Get current game state from a specific character's perspective."""
+    """Get current game state from the authenticated user's perspective."""
     game_state = _get_game(request)
 
-    if character_id not in game_state.characters:
-        raise HTTPException(status_code=404, detail="Character not found in this game")
+    character_id = _find_character_by_owner(game_state, user.owner_id)
+    if character_id is None:
+        raise HTTPException(status_code=404, detail="You have no character in this game")
 
     character = game_state.characters[character_id]
 
@@ -69,8 +79,12 @@ def get_game_state(
 def submit_action(
     action: ActionRequest,
     request: Request,
+    user: User = Depends(get_current_user),
 ) -> ActionResult:
-    """Submit an action for the current turn."""
+    """Submit an action for the current turn.
+
+    The character_id is derived from the authenticated user's token.
+    """
     game_state = _get_game(request)
 
     if game_state.status != GameStatus.ACTIVE:
@@ -79,14 +93,19 @@ def submit_action(
             detail=f"Game is not active (status: {game_state.status.value})",
         )
 
-    if action.character_id not in game_state.characters:
-        raise HTTPException(status_code=404, detail="Character not found")
+    # Resolve character from authenticated user
+    character_id = _find_character_by_owner(game_state, user.owner_id)
+    if character_id is None:
+        raise HTTPException(status_code=404, detail="You have no character in this game")
+
+    # Inject character_id into the action for the engine
+    action.character_id = character_id
 
     current = get_current_turn_character(game_state)
-    if current is None or current.id != action.character_id:
+    if current is None or current.id != character_id:
         raise HTTPException(status_code=409, detail="It's not your turn")
 
-    _, result = process_action(game_state, action.character_id, action)
+    _, result = process_action(game_state, character_id, action)
 
     if not result.success:
         raise HTTPException(status_code=400, detail=result.error)

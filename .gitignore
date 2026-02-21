@@ -7,3 +7,5 @@ __pycache__/
 tendrils-server-instructions.md
 game_state.json
 game_state.json.tmp
+tokens.json
+tokens.json.tmp

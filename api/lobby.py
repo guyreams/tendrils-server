@@ -2,9 +2,10 @@
 
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
+from auth import User, get_current_user
 from config import MAX_PLAYERS_PER_GAME, SAVE_FILE
 from engine.combat import (
     add_character,
@@ -19,7 +20,6 @@ router = APIRouter()
 
 class JoinGameRequest(BaseModel):
     """Request body for joining the game with a character."""
-    owner_id: str
     name: str
     ability_scores: AbilityScores = AbilityScores()
     max_hp: int
@@ -101,14 +101,21 @@ def _place_character(game_state: GameState, character: Character) -> None:
 
 
 @router.post("/join", response_model=JoinGameResponse)
-def join_game(body: JoinGameRequest, request: Request) -> JoinGameResponse:
+def join_game(
+    body: JoinGameRequest,
+    request: Request,
+    user: User = Depends(get_current_user),
+) -> JoinGameResponse:
     """Join the game or reconnect to an existing character.
 
     - If owner_id has a living character: reconnect and return existing character_id.
     - If owner_id has a dead character: remove the dead one, create a new character.
     - If owner_id is new: create a new character.
+
+    The owner_id is derived from the authenticated user's API key.
     """
     game_state = _get_game(request)
+    owner_id = user.owner_id
 
     if game_state.status != GameStatus.WAITING:
         raise HTTPException(
@@ -116,7 +123,7 @@ def join_game(body: JoinGameRequest, request: Request) -> JoinGameResponse:
             detail="Combat is in progress. Cannot join until it ends.",
         )
 
-    existing = _find_character_by_owner(game_state, body.owner_id)
+    existing = _find_character_by_owner(game_state, owner_id)
 
     if existing is not None and existing.is_alive:
         # Reconnect to existing living character
@@ -135,7 +142,7 @@ def join_game(body: JoinGameRequest, request: Request) -> JoinGameResponse:
         character = Character(
             id=character_id,
             name=body.name,
-            owner_id=body.owner_id,
+            owner_id=owner_id,
             ability_scores=body.ability_scores,
             max_hp=body.max_hp,
             current_hp=body.max_hp,
@@ -161,7 +168,7 @@ def join_game(body: JoinGameRequest, request: Request) -> JoinGameResponse:
     character = Character(
         id=character_id,
         name=body.name,
-        owner_id=body.owner_id,
+        owner_id=owner_id,
         ability_scores=body.ability_scores,
         max_hp=body.max_hp,
         current_hp=body.max_hp,
@@ -178,7 +185,7 @@ def join_game(body: JoinGameRequest, request: Request) -> JoinGameResponse:
 
 
 @router.post("/start", response_model=StartGameResponse)
-def start_game(request: Request) -> StartGameResponse:
+def start_game(request: Request, user: User = Depends(get_current_user)) -> StartGameResponse:
     """Start combat (requires 2+ characters)."""
     game_state = _get_game(request)
 
