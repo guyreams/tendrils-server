@@ -12,7 +12,8 @@ from auth import (
     get_token_for_owner,
     rotate_token,
 )
-from config import ADMIN_SECRET, SAVE_FILE
+import config
+from config import SAVE_FILE, save_secret
 from engine.combat import save_game, end_combat
 from models.game_state import GameStatus
 
@@ -48,6 +49,40 @@ class DeleteUserResponse(BaseModel):
     character_removed: bool
 
 
+class ChangeSecretRequest(BaseModel):
+    """Request body for changing the admin secret."""
+    new_secret: str
+
+
+class ChangeSecretResponse(BaseModel):
+    """Response after changing the admin secret."""
+    message: str
+
+
+@router.put("/secret", response_model=ChangeSecretResponse)
+def change_admin_secret(
+    body: ChangeSecretRequest,
+    x_admin_secret: str = Header(..., alias="X-Admin-Secret"),
+) -> ChangeSecretResponse:
+    """Change the admin secret at runtime.
+
+    Requires the current X-Admin-Secret header. The new secret takes
+    effect immediately — subsequent requests must use it.
+    """
+    if x_admin_secret != config.ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid admin secret")
+
+    if not body.new_secret or len(body.new_secret) < 8:
+        raise HTTPException(
+            status_code=400,
+            detail="New secret must be at least 8 characters",
+        )
+
+    config.ADMIN_SECRET = body.new_secret
+    save_secret()
+    return ChangeSecretResponse(message="Admin secret updated")
+
+
 @router.post("/register", response_model=RegisterResponse)
 def register_user(
     body: RegisterRequest,
@@ -57,7 +92,7 @@ def register_user(
 
     Requires the X-Admin-Secret header to match the server's admin secret.
     """
-    if x_admin_secret != ADMIN_SECRET:
+    if x_admin_secret != config.ADMIN_SECRET:
         raise HTTPException(status_code=403, detail="Invalid admin secret")
 
     try:
@@ -76,7 +111,7 @@ def list_users(
 
     Requires the X-Admin-Secret header.
     """
-    if x_admin_secret != ADMIN_SECRET:
+    if x_admin_secret != config.ADMIN_SECRET:
         raise HTTPException(status_code=403, detail="Invalid admin secret")
 
     return [
@@ -94,7 +129,7 @@ def get_user_token(
 
     Requires the X-Admin-Secret header.
     """
-    if x_admin_secret != ADMIN_SECRET:
+    if x_admin_secret != config.ADMIN_SECRET:
         raise HTTPException(status_code=403, detail="Invalid admin secret")
 
     api_key = get_token_for_owner(owner_id)
@@ -114,7 +149,7 @@ def edit_user(
 
     Requires the X-Admin-Secret header.
     """
-    if x_admin_secret != ADMIN_SECRET:
+    if x_admin_secret != config.ADMIN_SECRET:
         raise HTTPException(status_code=403, detail="Invalid admin secret")
 
     updated = update_user(owner_id, body.name)
@@ -133,7 +168,7 @@ def rotate_user_token(
 
     Requires the X-Admin-Secret header.
     """
-    if x_admin_secret != ADMIN_SECRET:
+    if x_admin_secret != config.ADMIN_SECRET:
         raise HTTPException(status_code=403, detail="Invalid admin secret")
 
     new_key = rotate_token(owner_id)
@@ -153,7 +188,7 @@ def delete_user(
 
     Requires the X-Admin-Secret header.
     """
-    if x_admin_secret != ADMIN_SECRET:
+    if x_admin_secret != config.ADMIN_SECRET:
         raise HTTPException(status_code=403, detail="Invalid admin secret")
 
     deleted = delete_token(owner_id)

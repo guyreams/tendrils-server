@@ -14,3 +14,22 @@ GAME_NAME = "Tendrils Arena"   # Name of the single persistent game
 GAME_ID = "tendrils"           # Fixed game ID
 TOKENS_FILE = os.path.join(DATA_DIR, "tokens.json")
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "change-me-in-production")
+SECRET_FILE = os.path.join(DATA_DIR, "admin_secret.txt")
+
+
+def load_secret() -> None:
+    """Load admin secret from persistent file, if it exists."""
+    global ADMIN_SECRET
+    if os.path.exists(SECRET_FILE):
+        with open(SECRET_FILE) as f:
+            stored = f.read().strip()
+        if stored:
+            ADMIN_SECRET = stored
+
+
+def save_secret() -> None:
+    """Persist current admin secret to file (atomic write)."""
+    tmp_path = SECRET_FILE + ".tmp"
+    with open(tmp_path, "w") as f:
+        f.write(ADMIN_SECRET)
+    os.replace(tmp_path, SECRET_FILE)

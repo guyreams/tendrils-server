@@ -10,6 +10,7 @@ Usage:
     python manage_tokens.py edit --owner bot_c --name "New Name"
     python manage_tokens.py rotate --owner bot_c
     python manage_tokens.py delete --owner bot_c
+    python manage_tokens.py set-secret --new-secret "my-new-secret"
 
 Environment variables:
     TENDRILS_URL     — Server URL (default: http://127.0.0.1:8000)
@@ -117,6 +118,15 @@ def delete_user(url: str, owner_id: str) -> None:
         print("In-game character was also removed.")
 
 
+def set_secret(url: str, new_secret: str) -> None:
+    """Change the admin secret on the running server."""
+    resp = _request("PUT", f"{url}/admin/secret", json={"new_secret": new_secret})
+    _handle_error(resp)
+    data = resp.json()
+    print(data["message"])
+    print("Remember to update your ADMIN_SECRET env var to match.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Manage Tendrils Server API keys",
@@ -154,6 +164,10 @@ def main() -> None:
     delete_parser.add_argument("--owner", required=True, help="owner_id to delete")
     delete_parser.add_argument("--url", **url_kwargs)
 
+    secret_parser = subparsers.add_parser("set-secret", help="Change the admin secret")
+    secret_parser.add_argument("--new-secret", required=True, help="New admin secret (min 8 chars)")
+    secret_parser.add_argument("--url", **url_kwargs)
+
     args = parser.parse_args()
 
     if args.command == "create":
@@ -168,6 +182,8 @@ def main() -> None:
         rotate_user_token(args.url, args.owner)
     elif args.command == "delete":
         delete_user(args.url, args.owner)
+    elif args.command == "set-secret":
+        set_secret(args.url, args.new_secret)
 
 
 if __name__ == "__main__":

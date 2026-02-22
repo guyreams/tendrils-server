@@ -7,7 +7,7 @@ from api.lobby import router as lobby_router
 from api.game import router as game_router
 from api.ws import router as ws_router
 from auth import load_tokens
-from config import GAME_ID, GAME_NAME, SAVE_FILE
+from config import GAME_ID, GAME_NAME, SAVE_FILE, load_secret
 from engine.combat import create_game, end_combat, load_game, save_game
 from models.game_state import GameStatus
 
@@ -16,6 +16,9 @@ app = FastAPI(
     description="A headless Dungeon Master for AI bot combat arenas",
     version="0.1.0",
 )
+
+# Load persisted admin secret (overrides env var if file exists)
+load_secret()
 
 # Load token store
 load_tokens()
