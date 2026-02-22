@@ -40,3 +40,4 @@ class Character(BaseModel):
     is_alive: bool = True
     conditions: list[str] = []     # e.g., ["prone", "grappled"]
     attacks: list[Attack] = []     # Available attacks
+    is_npc: bool = False           # Server-controlled NPC (not a player)

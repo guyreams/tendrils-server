@@ -185,6 +185,9 @@ def resolve_attack(
 def apply_damage(character: Character, damage: int) -> Character:
     """Apply damage to a character, reducing HP and checking for death.
 
+    If the character is an NPC, marks it as 'provoked' so its AI
+    knows to retaliate on its next turn.
+
     Args:
         character: The character taking damage.
         damage: Amount of damage to deal.
@@ -195,6 +198,8 @@ def apply_damage(character: Character, damage: int) -> Character:
     character.current_hp = max(0, character.current_hp - damage)
     if check_death(character):
         character.is_alive = False
+    elif character.is_npc and "provoked" not in character.conditions:
+        character.conditions.append("provoked")
     return character
 
 

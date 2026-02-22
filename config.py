@@ -11,6 +11,7 @@ DEFAULT_MOVEMENT_SPEED = 30  # feet per turn (6 squares)
 DATA_DIR = os.environ.get("DATA_DIR", ".")  # Persistent data directory
 SAVE_FILE = os.path.join(DATA_DIR, "game_state.json")
 GAME_NAME = "Tendrils Arena"   # Name of the single persistent game
+SPAWN_GOLEM = True             # Spawn the GOLEM practice NPC at grid centre
 GAME_ID = "tendrils"           # Fixed game ID
 TOKENS_FILE = os.path.join(DATA_DIR, "tokens.json")
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "change-me-in-production")

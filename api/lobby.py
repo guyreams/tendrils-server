@@ -160,8 +160,9 @@ def join_game(
             ),
         )
 
-    # New player
-    if len(game_state.characters) >= MAX_PLAYERS_PER_GAME:
+    # New player — count only non-NPC characters toward the limit
+    player_count = sum(1 for c in game_state.characters.values() if not c.is_npc)
+    if player_count >= MAX_PLAYERS_PER_GAME:
         raise HTTPException(status_code=400, detail="Game is full")
 
     character_id = str(uuid4())
@@ -192,10 +193,11 @@ def start_game(request: Request, user: User = Depends(get_current_user)) -> Star
     if game_state.status != GameStatus.WAITING:
         raise HTTPException(status_code=400, detail="Game has already started")
 
-    if len(game_state.characters) < 2:
+    player_count = sum(1 for c in game_state.characters.values() if not c.is_npc)
+    if player_count < 2:
         raise HTTPException(
             status_code=400,
-            detail="Need at least 2 characters to start",
+            detail="Need at least 2 player characters to start",
         )
 
     start_combat(game_state)

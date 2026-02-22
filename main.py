@@ -8,7 +8,7 @@ from api.game import router as game_router
 from api.ws import router as ws_router
 from auth import load_tokens
 from config import GAME_ID, GAME_NAME, SAVE_FILE, load_secret
-from engine.combat import create_game, end_combat, load_game, save_game
+from engine.combat import create_game, end_combat, load_game, save_game, spawn_npcs
 from models.game_state import GameStatus
 
 app = FastAPI(
@@ -30,9 +30,14 @@ if loaded is not None:
     # If the server restarts while in COMPLETED state, transition to WAITING
     if loaded.status == GameStatus.COMPLETED:
         end_combat(loaded)
-        save_game(loaded, SAVE_FILE)
+    # Ensure NPCs are present (idempotent)
+    spawn_npcs(loaded)
+    save_game(loaded, SAVE_FILE)
 else:
-    app.state.game = create_game(GAME_ID, name=GAME_NAME)
+    game = create_game(GAME_ID, name=GAME_NAME)
+    spawn_npcs(game)
+    save_game(game, SAVE_FILE)
+    app.state.game = game
 
 app.include_router(admin_router, prefix="/admin", tags=["Admin"])
 app.include_router(lobby_router, prefix="/game", tags=["Lobby"])
